@@ -3,11 +3,11 @@ import psycopg2
 
 
 def get_conn():
-    host = os.getenv("DB_HOST", "localhost")
-    dbname = os.getenv("DB_NAME", "renaultdb")
-    user = os.getenv("DB_USER", "postgres")
-    password = os.getenv("DB_PASS")  # no default on purpose
-    port = int(os.getenv("DB_PORT", "5432"))
+    host = "avo-adb-001.postgres.database.azure.com"
+    dbname = "renault_tests"
+    user = "adminavo"
+    password = "$#fKcdXPg4@ue8AW"  # no default on purpose
+    port =5432
 
     if password is None or password == "":
         raise RuntimeError(
