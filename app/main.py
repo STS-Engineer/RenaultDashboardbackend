@@ -605,7 +605,16 @@ async def upload_file(file: UploadFile = File(...)):
               {_clean_sql_float("tension3")}
 
             FROM measurements_staging
-        """
+            WHERE
+            NOT (
+                COALESCE(btrim(rpm),'')        ~ '^0*([.,]0*)?$'
+                AND COALESCE(btrim(cons_alim_1),'') ~ '^0*([.,]0*)?$'
+                AND COALESCE(btrim(tension1),'')    ~ '^0*([.,]0*)?$'
+                AND COALESCE(btrim(tension2),'')    ~ '^0*([.,]0*)?$'
+                AND COALESCE(btrim(tension3),'')    ~ '^0*([.,]0*)?$'
+          )
+
+       """
 
         t_ins0 = time.perf_counter()
         cur.execute(insert_sql, (test_id,))
