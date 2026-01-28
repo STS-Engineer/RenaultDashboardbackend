@@ -22,3 +22,28 @@ def get_conn():
         password=password,
         port=port,
     )
+def get_conn_bt():
+    """
+    New DB connection (BT DB). Use env vars; don't hardcode secrets.
+    Required env vars:
+    BT_DB_HOST, BT_DB_NAME, BT_DB_USER, BT_DB_PASS, BT_DB_PORT(optional)
+    """
+    host = os.getenv("BT_DB_HOST")
+    dbname = os.getenv("BT_DB_NAME")
+    user = os.getenv("BT_DB_USER")
+    password = os.getenv("BT_DB_PASS")
+    port = int(os.getenv("BT_DB_PORT", "5432"))
+    
+    
+    if not host or not dbname or not user or not password:
+        raise RuntimeError("Missing BT DB env vars: BT_DB_HOST/NAME/USER/PASS (and optional PORT).")
+    
+    
+    return psycopg2.connect(
+        host=host,
+        dbname=dbname,
+        user=user,
+        password=password,
+        port=port,
+        sslmode="require",
+    )
