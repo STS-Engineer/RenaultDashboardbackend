@@ -1318,9 +1318,8 @@ def live_series(
 @app.get("/bt/tests")
 def bt_tests():
     return [{"id": 1, "name": "BT1"}, {"id": 2, "name": "BT2"}]
-# --- helpers: safe casts for BT tables (avoid 500 on dirty text) ---
+    
 def _sql_safe_float(expr: str) -> str:
-    # Works even if expr is numeric or text. Uses ::text to unify.
     return f"""
     CASE
       WHEN {expr} IS NULL THEN NULL
@@ -1333,7 +1332,6 @@ def _sql_safe_float(expr: str) -> str:
     """.strip()
 
 def _sql_safe_bigint(expr: str) -> str:
-    # Accept only pure integers (optionally signed). Otherwise NULL.
     return f"""
     CASE
       WHEN {expr} IS NULL THEN NULL
@@ -1353,7 +1351,6 @@ def bt_series(
     t_start_sec: float = Query(0.0, ge=0.0),
     t_end_sec: float = Query(0.0, ge=0.0),
 ):
-    # BT table selection
     if test_id == 1:
         table = '"Banc_Test_Rotor"."BT1"'
     elif test_id == 2:
@@ -1361,9 +1358,8 @@ def bt_series(
     else:
         raise HTTPException(status_code=400, detail="test_id must be 1 (BT1) or 2 (BT2)")
 
-    sfx = f"S{system}"  # matches SONDE_*_S1/S2/S3
+    sfx = f"S{system}"
 
-    # time window expressed in "rn" (row number), because there is no idx/time in BT tables
     start_rn = int(round(t_start_sec / dt_sec)) if t_start_sec > 0 else 0
     end_rn = None
     if t_end_sec and t_end_sec > 0:
@@ -1381,7 +1377,6 @@ def bt_series(
             params["end_rn"] = end_rn
             end_filter = "AND rn <= %(end_rn)s"
 
-        # Safe expressions (prevents invalid casts from crashing the whole query)
         codeur_int = _sql_safe_bigint('"CODEUR"')
         rpm = _sql_safe_float('"RPM"')
         cons = _sql_safe_float('"CONS_ALIM_1"')
@@ -1389,7 +1384,6 @@ def bt_series(
         t2 = _sql_safe_float('"TENSION2"')
         t3 = _sql_safe_float('"TENSION3"')
 
-        # Temperatures divided by 10 (keep your fix) + safe float
         b1 = _sql_safe_float(f'"SONDE_BRUSH_1_{sfx}"') + " / 10.0"
         b2 = _sql_safe_float(f'"SONDE_BRUSH_2_{sfx}"') + " / 10.0"
         b3 = _sql_safe_float(f'"SONDE_BRUSH_3_{sfx}"') + " / 10.0"
@@ -1398,8 +1392,6 @@ def bt_series(
         l2 = _sql_safe_float(f'"SONDE_LOWER_2_{sfx}"') + " / 10.0"
         sup = _sql_safe_float(f'"SONDE_SUPPORT_{sfx}"') + " / 10.0"
 
-        # NOTE: row_number ORDER BY uses CODEUR::text so it can't crash due to casting.
-        # If CODEUR is numeric in your DB, this still works.
         sql = f"""
         WITH base AS (
           SELECT
@@ -1430,7 +1422,7 @@ def bt_series(
         FROM base
         WHERE rn >= %(start_rn)s
           {end_filter}
-          AND (rn % %(step)s) = 0
+          AND (rn %% %(step)s) = 0   -- ✅ ESCAPE modulo percent
         ORDER BY rn
         """
 
@@ -1438,7 +1430,6 @@ def bt_series(
             cur.execute(sql, params)
             fetched = cur.fetchall()
         except Exception as e:
-            # Temporary: surface the real DB error in Swagger instead of generic 500
             raise HTTPException(status_code=500, detail=f"BT query failed: {e}")
 
         out = []
@@ -1446,7 +1437,6 @@ def bt_series(
             rn = int(r[0])
             t_sec = rn * float(dt_sec)
 
-            # idx may be NULL if CODEUR wasn't a clean integer; fall back to rn for charting
             idx_val = r[1]
             idx_out = int(idx_val) if idx_val is not None else rn
 
