@@ -1361,82 +1361,95 @@ def bt_series(
     sfx = f"S{system}"
 
     start_rn = int(round(t_start_sec / dt_sec)) if t_start_sec > 0 else 0
-    end_rn = None
+
+    # ✅ Force a finite window if user keeps t_end_sec=0
+    MAX_WINDOW_SEC = 30 * 60  # 30 min
     if t_end_sec and t_end_sec > 0:
         if t_end_sec < t_start_sec:
             raise HTTPException(status_code=400, detail="t_end_sec must be >= t_start_sec (or 0 for all).")
         end_rn = int(round(t_end_sec / dt_sec))
+    else:
+        end_rn = start_rn + int(MAX_WINDOW_SEC / dt_sec)
+
+    window_rows = max(1, (end_rn - start_rn) + 1)
+
+    # ✅ Cap number of points returned
+    MAX_POINTS = 8000
+    auto_step = max(1, (window_rows + MAX_POINTS - 1) // MAX_POINTS)
+    effective_step = max(step, auto_step)
+
+    params = {
+        "start_rn": start_rn,
+        "limit_rows": window_rows,
+        "step": effective_step,
+    }
+
+    codeur_int = _sql_safe_bigint('"CODEUR"')
+    rpm = _sql_safe_float('"RPM"')
+    cons = _sql_safe_float('"CONS_ALIM_1"')
+    t1 = _sql_safe_float('"TENSION1"')
+    t2 = _sql_safe_float('"TENSION2"')
+    t3 = _sql_safe_float('"TENSION3"')
+
+    # temps /10
+    b1 = _sql_safe_float(f'"SONDE_BRUSH_1_{sfx}"') + " / 10.0"
+    b2 = _sql_safe_float(f'"SONDE_BRUSH_2_{sfx}"') + " / 10.0"
+    b3 = _sql_safe_float(f'"SONDE_BRUSH_3_{sfx}"') + " / 10.0"
+    b4 = _sql_safe_float(f'"SONDE_BRUSH_4_{sfx}"') + " / 10.0"
+    l1 = _sql_safe_float(f'"SONDE_LOWER_1_{sfx}"') + " / 10.0"
+    l2 = _sql_safe_float(f'"SONDE_LOWER_2_{sfx}"') + " / 10.0"
+    sup = _sql_safe_float(f'"SONDE_SUPPORT_{sfx}"') + " / 10.0"
+
+    # ✅ Slice first (OFFSET/LIMIT) => avoids scanning/sorting whole table => no timeout
+    sql = f"""
+    WITH sliced AS (
+      SELECT *
+      FROM {table}
+      WHERE "CODEUR" IS NOT NULL
+      ORDER BY ("CODEUR")::text
+      OFFSET %(start_rn)s
+      LIMIT %(limit_rows)s
+    ),
+    base AS (
+      SELECT
+        (row_number() OVER (ORDER BY ("CODEUR")::text) - 1 + %(start_rn)s)::bigint AS rn,
+        {codeur_int} AS idx,
+
+        {rpm}  AS rpm,
+        {cons} AS current_a,
+
+        {t1} AS t1,
+        {t2} AS t2,
+        {t3} AS t3,
+
+        ({b1})  AS b1,
+        ({b2})  AS b2,
+        ({b3})  AS b3,
+        ({b4})  AS b4,
+
+        ({l1})  AS l1,
+        ({l2})  AS l2,
+
+        ({sup}) AS sup
+      FROM sliced
+    )
+    SELECT rn, idx, rpm, current_a, t1, t2, t3, b1, b2, b3, b4, l1, l2, sup
+    FROM base
+    WHERE (rn %% %(step)s) = 0
+    ORDER BY rn
+    LIMIT {MAX_POINTS}
+    """
 
     conn = get_conn_bt()
     cur = conn.cursor()
-
     try:
-        params = {"start_rn": start_rn, "step": step}
-        end_filter = ""
-        if end_rn is not None:
-            params["end_rn"] = end_rn
-            end_filter = "AND rn <= %(end_rn)s"
-
-        codeur_int = _sql_safe_bigint('"CODEUR"')
-        rpm = _sql_safe_float('"RPM"')
-        cons = _sql_safe_float('"CONS_ALIM_1"')
-        t1 = _sql_safe_float('"TENSION1"')
-        t2 = _sql_safe_float('"TENSION2"')
-        t3 = _sql_safe_float('"TENSION3"')
-
-        b1 = _sql_safe_float(f'"SONDE_BRUSH_1_{sfx}"') + " / 10.0"
-        b2 = _sql_safe_float(f'"SONDE_BRUSH_2_{sfx}"') + " / 10.0"
-        b3 = _sql_safe_float(f'"SONDE_BRUSH_3_{sfx}"') + " / 10.0"
-        b4 = _sql_safe_float(f'"SONDE_BRUSH_4_{sfx}"') + " / 10.0"
-        l1 = _sql_safe_float(f'"SONDE_LOWER_1_{sfx}"') + " / 10.0"
-        l2 = _sql_safe_float(f'"SONDE_LOWER_2_{sfx}"') + " / 10.0"
-        sup = _sql_safe_float(f'"SONDE_SUPPORT_{sfx}"') + " / 10.0"
-
-        sql = f"""
-        WITH base AS (
-          SELECT
-            row_number() OVER (ORDER BY ("CODEUR")::text) - 1 AS rn,
-
-            {codeur_int} AS idx,
-
-            {rpm}  AS rpm,
-            {cons} AS current_a,
-
-            {t1} AS t1,
-            {t2} AS t2,
-            {t3} AS t3,
-
-            ({b1})  AS b1,
-            ({b2})  AS b2,
-            ({b3})  AS b3,
-            ({b4})  AS b4,
-
-            ({l1})  AS l1,
-            ({l2})  AS l2,
-
-            ({sup}) AS sup
-          FROM {table}
-          WHERE "CODEUR" IS NOT NULL
-        )
-        SELECT rn, idx, rpm, current_a, t1, t2, t3, b1, b2, b3, b4, l1, l2, sup
-        FROM base
-        WHERE rn >= %(start_rn)s
-          {end_filter}
-          AND (rn %% %(step)s) = 0   -- ✅ ESCAPE modulo percent
-        ORDER BY rn
-        """
-
-        try:
-            cur.execute(sql, params)
-            fetched = cur.fetchall()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"BT query failed: {e}")
+        cur.execute(sql, params)
+        fetched = cur.fetchall()
 
         out = []
         for r in fetched:
             rn = int(r[0])
             t_sec = rn * float(dt_sec)
-
             idx_val = r[1]
             idx_out = int(idx_val) if idx_val is not None else rn
 
@@ -1458,8 +1471,7 @@ def bt_series(
                 "hours": t_sec / 3600.0,
             })
 
-        out = _apply_smoothing(out, window=3)
-        return out
+        return _apply_smoothing(out, window=3)
 
     finally:
         try:
