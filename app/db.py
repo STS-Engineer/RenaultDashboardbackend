@@ -28,11 +28,11 @@ def get_conn_bt():
     Required env vars:
     BT_DB_HOST, BT_DB_NAME, BT_DB_USER, BT_DB_PASS, BT_DB_PORT(optional)
     """
-    host = os.getenv("BT_DB_HOST")
-    dbname = os.getenv("BT_DB_NAME")
-    user = os.getenv("BT_DB_USER")
-    password = os.getenv("BT_DB_PASS")
-    port = int(os.getenv("BT_DB_PORT", "5432"))
+    host ="avo-adb-002.postgres.database.azure.com"
+    dbname ="cyclame_test1"
+    user ="administrationSTS"
+    password ="St$@0987"
+    port =5432
     
     
     if not host or not dbname or not user or not password:
