@@ -13,7 +13,7 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db import get_conn
+from app.db import get_conn,get_conn_bt
 
 app = FastAPI()
 
@@ -1315,3 +1315,110 @@ def live_series(
         })
 
     return out
+@app.get("/bt/tests")
+def bt_tests():
+    return [{"id": 1, "name": "BT1"}, {"id": 2, "name": "BT2"}]
+@app.get("/bt/series/{test_id}")
+def bt_series(
+    test_id: int,
+    system: int = Query(1, ge=1, le=3),
+    step: int = Query(400, ge=1),
+    dt_sec: float = Query(0.05, gt=0.0),
+    t_start_sec: float = Query(0.0, ge=0.0),
+    t_end_sec: float = Query(0.0, ge=0.0),
+):
+    # BT table selection
+    if test_id == 1:
+        table = '"Banc_Test_Rotor"."BT1"'
+    elif test_id == 2:
+        table = '"Banc_Test_Rotor"."BT2"'
+    else:
+        raise HTTPException(status_code=400, detail="test_id must be 1 (BT1) or 2 (BT2)")
+
+    sfx = f"S{system}"  # matches SONDE_*_S1/S2/S3
+
+    # time window expressed in "rn" (row number), because there is no idx/time in BT tables
+    start_rn = int(round(t_start_sec / dt_sec)) if t_start_sec > 0 else 0
+    end_rn = None
+    if t_end_sec and t_end_sec > 0:
+        if t_end_sec < t_start_sec:
+            raise HTTPException(status_code=400, detail="t_end_sec must be >= t_start_sec (or 0 for all).")
+        end_rn = int(round(t_end_sec / dt_sec))
+
+    conn = get_conn_bt()
+    cur = conn.cursor()
+    try:
+        params = {"start_rn": start_rn, "step": step}
+        end_filter = ""
+        if end_rn is not None:
+            params["end_rn"] = end_rn
+            end_filter = 'AND rn <= %(end_rn)s'
+
+        # temps are divided by 10.0 here (fix your 10x issue)
+        sql = f"""
+        WITH base AS (
+          SELECT
+            row_number() OVER (ORDER BY "CODEUR") - 1 AS rn,
+            "CODEUR"::bigint AS idx,
+
+            "RPM"::double precision AS rpm,
+            "CONS_ALIM_1"::double precision AS current_a,
+
+            "TENSION1"::double precision AS t1,
+            "TENSION2"::double precision AS t2,
+            "TENSION3"::double precision AS t3,
+
+            ("SONDE_BRUSH_1_{sfx}" / 10.0)::double precision AS b1,
+            ("SONDE_BRUSH_2_{sfx}" / 10.0)::double precision AS b2,
+            ("SONDE_BRUSH_3_{sfx}" / 10.0)::double precision AS b3,
+            ("SONDE_BRUSH_4_{sfx}" / 10.0)::double precision AS b4,
+
+            ("SONDE_LOWER_1_{sfx}" / 10.0)::double precision AS l1,
+            ("SONDE_LOWER_2_{sfx}" / 10.0)::double precision AS l2,
+
+            ("SONDE_SUPPORT_{sfx}" / 10.0)::double precision AS sup
+          FROM {table}
+          WHERE "CODEUR" IS NOT NULL
+        )
+        SELECT rn, idx, rpm, current_a, t1, t2, t3, b1, b2, b3, b4, l1, l2, sup
+        FROM base
+        WHERE rn >= %(start_rn)s
+          {end_filter}
+          AND (rn % %(step)s) = 0
+        ORDER BY rn
+        """
+
+        cur.execute(sql, params)
+        fetched = cur.fetchall()
+
+        out = []
+        for r in fetched:
+            rn = int(r[0])
+            t_sec = rn * float(dt_sec)
+            out.append({
+                "idx": int(r[1]),
+                "rpm": r[2],
+                "current_a": r[3],
+                "t1": r[4],
+                "t2": r[5],
+                "t3": r[6],
+                "b1": r[7],
+                "b2": r[8],
+                "b3": r[9],
+                "b4": r[10],
+                "l1": r[11],
+                "l2": r[12],
+                "sup": r[13],
+                "t_sec": t_sec,
+                "hours": t_sec / 3600.0,
+            })
+
+        # optional: reuse your smoothing
+        out = _apply_smoothing(out, window=3)
+        return out
+
+    finally:
+        try: cur.close()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
