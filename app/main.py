@@ -1341,15 +1341,25 @@ def _sql_safe_bigint(expr: str) -> str:
     END
     """.strip()
 
-
 @app.get("/bt/series/{test_id}")
 def bt_series(
     test_id: int,
     system: int = Query(1, ge=1, le=3),
-    step: int = Query(400, ge=1),
+
+    # step is now a cheap downsample based on CODEUR (not row_number)
+    step: int = Query(1, ge=1),
+
+    # keyset pagination cursor (no OFFSET!)
+    after_codeur: int = Query(0, ge=0),
+
+    # max points per call (must be bounded for 27M rows)
+    limit: int = Query(8000, ge=100, le=50000),
+
+    # optional "stop at" cursor (lets you get a specific range if you want)
+    end_codeur: int = Query(0, ge=0),
+
+    # for frontend compatibility (still returned)
     dt_sec: float = Query(0.05, gt=0.0),
-    t_start_sec: float = Query(0.0, ge=0.0),
-    t_end_sec: float = Query(0.0, ge=0.0),
 ):
     if test_id == 1:
         table = '"Banc_Test_Rotor"."BT1"'
@@ -1360,60 +1370,40 @@ def bt_series(
 
     sfx = f"S{system}"
 
-    start_rn = int(round(t_start_sec / dt_sec)) if t_start_sec > 0 else 0
-
-    # ✅ Force a finite window if user keeps t_end_sec=0
-    MAX_WINDOW_SEC = 30 * 60  # 30 min
-    if t_end_sec and t_end_sec > 0:
-        if t_end_sec < t_start_sec:
-            raise HTTPException(status_code=400, detail="t_end_sec must be >= t_start_sec (or 0 for all).")
-        end_rn = int(round(t_end_sec / dt_sec))
-    else:
-        end_rn = start_rn + int(MAX_WINDOW_SEC / dt_sec)
-
-    window_rows = max(1, (end_rn - start_rn) + 1)
-
-    # ✅ Cap number of points returned
-    MAX_POINTS = 8000
-    auto_step = max(1, (window_rows + MAX_POINTS - 1) // MAX_POINTS)
-    effective_step = max(step, auto_step)
-
-    params = {
-        "start_rn": start_rn,
-        "limit_rows": window_rows,
-        "step": effective_step,
-    }
-
-    codeur_int = _sql_safe_bigint('"CODEUR"')
+    # Safe expressions
+    codeur = _sql_safe_bigint('"CODEUR"')  # CODEUR becomes idx/timebase
     rpm = _sql_safe_float('"RPM"')
     cons = _sql_safe_float('"CONS_ALIM_1"')
     t1 = _sql_safe_float('"TENSION1"')
     t2 = _sql_safe_float('"TENSION2"')
     t3 = _sql_safe_float('"TENSION3"')
 
-    # temps /10
-    b1 = _sql_safe_float(f'"SONDE_BRUSH_1_{sfx}"') + " / 10.0"
-    b2 = _sql_safe_float(f'"SONDE_BRUSH_2_{sfx}"') + " / 10.0"
-    b3 = _sql_safe_float(f'"SONDE_BRUSH_3_{sfx}"') + " / 10.0"
-    b4 = _sql_safe_float(f'"SONDE_BRUSH_4_{sfx}"') + " / 10.0"
-    l1 = _sql_safe_float(f'"SONDE_LOWER_1_{sfx}"') + " / 10.0"
-    l2 = _sql_safe_float(f'"SONDE_LOWER_2_{sfx}"') + " / 10.0"
-    sup = _sql_safe_float(f'"SONDE_SUPPORT_{sfx}"') + " / 10.0"
+    # temps: keep RAW here; scale in frontend (you said /100)
+    b1 = _sql_safe_float(f'"SONDE_BRUSH_1_{sfx}"')
+    b2 = _sql_safe_float(f'"SONDE_BRUSH_2_{sfx}"')
+    b3 = _sql_safe_float(f'"SONDE_BRUSH_3_{sfx}"')
+    b4 = _sql_safe_float(f'"SONDE_BRUSH_4_{sfx}"')
+    l1 = _sql_safe_float(f'"SONDE_LOWER_1_{sfx}"')
+    l2 = _sql_safe_float(f'"SONDE_LOWER_2_{sfx}"')
+    sup = _sql_safe_float(f'"SONDE_SUPPORT_{sfx}"')
 
-    # ✅ Slice first (OFFSET/LIMIT) => avoids scanning/sorting whole table => no timeout
+    # WHERE conditions: keyset pagination on CODEUR
+    # Note: we filter on CODEUR not-null and numeric
+    end_filter = ""
+    params = {
+        "after": after_codeur,
+        "step": step,
+        "limit": limit,
+    }
+    if end_codeur and end_codeur > 0:
+        end_filter = "AND codeur_val <= %(end)s"
+        params["end"] = end_codeur
+
+    # IMPORTANT: We compute codeur_val once in a CTE to reuse it in filters
     sql = f"""
-    WITH sliced AS (
-      SELECT *
-      FROM {table}
-      WHERE "CODEUR" IS NOT NULL
-      ORDER BY ("CODEUR")::text
-      OFFSET %(start_rn)s
-      LIMIT %(limit_rows)s
-    ),
-    base AS (
+    WITH src AS (
       SELECT
-        (row_number() OVER (ORDER BY ("CODEUR")::text) - 1 + %(start_rn)s)::bigint AS rn,
-        {codeur_int} AS idx,
+        {codeur} AS codeur_val,
 
         {rpm}  AS rpm,
         {cons} AS current_a,
@@ -1422,53 +1412,56 @@ def bt_series(
         {t2} AS t2,
         {t3} AS t3,
 
-        ({b1})  AS b1,
-        ({b2})  AS b2,
-        ({b3})  AS b3,
-        ({b4})  AS b4,
-
-        ({l1})  AS l1,
-        ({l2})  AS l2,
-
-        ({sup}) AS sup
-      FROM sliced
+        {b1} AS b1,
+        {b2} AS b2,
+        {b3} AS b3,
+        {b4} AS b4,
+        {l1} AS l1,
+        {l2} AS l2,
+        {sup} AS sup
+      FROM {table}
+      WHERE "CODEUR" IS NOT NULL
     )
-    SELECT rn, idx, rpm, current_a, t1, t2, t3, b1, b2, b3, b4, l1, l2, sup
-    FROM base
-    WHERE (rn %% %(step)s) = 0
-    ORDER BY rn
-    LIMIT {MAX_POINTS}
+    SELECT
+      codeur_val, rpm, current_a, t1, t2, t3, b1, b2, b3, b4, l1, l2, sup
+    FROM src
+    WHERE codeur_val IS NOT NULL
+      AND codeur_val > %(after)s
+      {end_filter}
+      AND (codeur_val %% %(step)s) = 0
+    ORDER BY codeur_val
+    LIMIT %(limit)s
     """
 
     conn = get_conn_bt()
     cur = conn.cursor()
     try:
+        # fail fast instead of hanging forever
+        cur.execute("SET statement_timeout TO '15s';")
+
         cur.execute(sql, params)
         fetched = cur.fetchall()
 
         out = []
         for r in fetched:
-            rn = int(r[0])
-            t_sec = rn * float(dt_sec)
-            idx_val = r[1]
-            idx_out = int(idx_val) if idx_val is not None else rn
-
+            codeur_val = int(r[0])
+            # if you want a fake time axis:
+            # t_sec is approximate: row index is not known, so we derive from codeur spacing is unknown.
+            # better: use codeur as x-axis in charts.
             out.append({
-                "idx": idx_out,
-                "rpm": r[2],
-                "current_a": r[3],
-                "t1": r[4],
-                "t2": r[5],
-                "t3": r[6],
-                "b1": r[7],
-                "b2": r[8],
-                "b3": r[9],
-                "b4": r[10],
-                "l1": r[11],
-                "l2": r[12],
-                "sup": r[13],
-                "t_sec": t_sec,
-                "hours": t_sec / 3600.0,
+                "idx": codeur_val,          # use this as X in frontend
+                "rpm": r[1],
+                "current_a": r[2],
+                "t1": r[3],
+                "t2": r[4],
+                "t3": r[5],
+                "b1": r[6],
+                "b2": r[7],
+                "b3": r[8],
+                "b4": r[9],
+                "l1": r[10],
+                "l2": r[11],
+                "sup": r[12],
             })
 
         return _apply_smoothing(out, window=3)
