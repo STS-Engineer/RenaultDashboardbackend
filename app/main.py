@@ -1345,22 +1345,16 @@ def _sql_safe_bigint(expr: str) -> str:
 def bt_series(
     test_id: int,
     system: int = Query(1, ge=1, le=3),
-
-    # step is now a cheap downsample based on CODEUR (not row_number)
-    step: int = Query(1, ge=1),
-
-    # keyset pagination cursor (no OFFSET!)
-    after_codeur: int = Query(0, ge=0),
-
-    # max points per call (must be bounded for 27M rows)
-    limit: int = Query(8000, ge=100, le=50000),
-
-    # optional "stop at" cursor (lets you get a specific range if you want)
-    end_codeur: int = Query(0, ge=0),
-
-    # for frontend compatibility (still returned)
+    step: int = Query(400, ge=1),
     dt_sec: float = Query(0.05, gt=0.0),
+    t_start_sec: float = Query(0.0, ge=0.0),
+    t_end_sec: float = Query(0.0, ge=0.0),
+
+    # optional pagination (safe for big tables)
+    after_idx: int = Query(-1, description="Return rows with idx > after_idx"),
+    limit: int = Query(8000, ge=100, le=50000),
 ):
+    # map test_id -> BT table
     if test_id == 1:
         table = '"Banc_Test_Rotor"."BT1"'
     elif test_id == 2:
@@ -1370,86 +1364,64 @@ def bt_series(
 
     sfx = f"S{system}"
 
-    # Safe expressions
-    codeur = _sql_safe_bigint('"CODEUR"')  # CODEUR becomes idx/timebase
-    rpm = _sql_safe_float('"RPM"')
-    cons = _sql_safe_float('"CONS_ALIM_1"')
-    t1 = _sql_safe_float('"TENSION1"')
-    t2 = _sql_safe_float('"TENSION2"')
-    t3 = _sql_safe_float('"TENSION3"')
+    # time window -> idx window
+    start_idx = int(round(t_start_sec / dt_sec)) if t_start_sec > 0 else 0
+    end_idx = None
+    if t_end_sec and t_end_sec > 0:
+        if t_end_sec < t_start_sec:
+            raise HTTPException(status_code=400, detail="t_end_sec must be >= t_start_sec (or 0 for all).")
+        end_idx = int(round(t_end_sec / dt_sec))
 
-    # temps: keep RAW here; scale in frontend (you said /100)
-    b1 = _sql_safe_float(f'"SONDE_BRUSH_1_{sfx}"')
-    b2 = _sql_safe_float(f'"SONDE_BRUSH_2_{sfx}"')
-    b3 = _sql_safe_float(f'"SONDE_BRUSH_3_{sfx}"')
-    b4 = _sql_safe_float(f'"SONDE_BRUSH_4_{sfx}"')
-    l1 = _sql_safe_float(f'"SONDE_LOWER_1_{sfx}"')
-    l2 = _sql_safe_float(f'"SONDE_LOWER_2_{sfx}"')
-    sup = _sql_safe_float(f'"SONDE_SUPPORT_{sfx}"')
-
-    # WHERE conditions: keyset pagination on CODEUR
-    # Note: we filter on CODEUR not-null and numeric
-    end_filter = ""
+    where_parts = [
+        "idx IS NOT NULL",
+        "idx >= %(start)s",
+        "(idx % %(step)s) = 0",
+        "idx > %(after)s",
+    ]
     params = {
-        "after": after_codeur,
+        "start": start_idx,
         "step": step,
+        "after": after_idx,
         "limit": limit,
     }
-    if end_codeur and end_codeur > 0:
-        end_filter = "AND codeur_val <= %(end)s"
-        params["end"] = end_codeur
+    if end_idx is not None:
+        where_parts.append("idx <= %(end)s")
+        params["end"] = end_idx
 
-    # IMPORTANT: We compute codeur_val once in a CTE to reuse it in filters
+    where_sql = " AND ".join(where_parts)
+
     sql = f"""
-    WITH src AS (
       SELECT
-        {codeur} AS codeur_val,
+        idx,
+        "RPM" AS rpm,
+        "CONS_ALIM_1" AS current_a,
+        "TENSION1" AS t1, "TENSION2" AS t2, "TENSION3" AS t3,
 
-        {rpm}  AS rpm,
-        {cons} AS current_a,
+        "SONDE_BRUSH_1_{sfx}" AS b1,
+        "SONDE_BRUSH_2_{sfx}" AS b2,
+        "SONDE_BRUSH_3_{sfx}" AS b3,
+        "SONDE_BRUSH_4_{sfx}" AS b4,
 
-        {t1} AS t1,
-        {t2} AS t2,
-        {t3} AS t3,
-
-        {b1} AS b1,
-        {b2} AS b2,
-        {b3} AS b3,
-        {b4} AS b4,
-        {l1} AS l1,
-        {l2} AS l2,
-        {sup} AS sup
+        "SONDE_LOWER_1_{sfx}" AS l1,
+        "SONDE_LOWER_2_{sfx}" AS l2,
+        "SONDE_SUPPORT_{sfx}" AS sup
       FROM {table}
-      WHERE "CODEUR" IS NOT NULL
-    )
-    SELECT
-      codeur_val, rpm, current_a, t1, t2, t3, b1, b2, b3, b4, l1, l2, sup
-    FROM src
-    WHERE codeur_val IS NOT NULL
-      AND codeur_val > %(after)s
-      {end_filter}
-      AND (codeur_val %% %(step)s) = 0
-    ORDER BY codeur_val
-    LIMIT %(limit)s
+      WHERE {where_sql}
+      ORDER BY idx
+      LIMIT %(limit)s
     """
 
     conn = get_conn_bt()
     cur = conn.cursor()
     try:
-        # fail fast instead of hanging forever
-        cur.execute("SET statement_timeout TO '15s';")
-
+        cur.execute("SET statement_timeout TO '30s';")
         cur.execute(sql, params)
         fetched = cur.fetchall()
 
-        out = []
+        rows = []
         for r in fetched:
-            codeur_val = int(r[0])
-            # if you want a fake time axis:
-            # t_sec is approximate: row index is not known, so we derive from codeur spacing is unknown.
-            # better: use codeur as x-axis in charts.
-            out.append({
-                "idx": codeur_val,          # use this as X in frontend
+            row = {
+                "idx": int(r[0]),
                 "rpm": r[1],
                 "current_a": r[2],
                 "t1": r[3],
@@ -1462,9 +1434,22 @@ def bt_series(
                 "l1": r[10],
                 "l2": r[11],
                 "sup": r[12],
-            })
+            }
 
-        return _apply_smoothing(out, window=3)
+            # same cleaning as your /series endpoint
+            if row["rpm"] is not None and float(row["rpm"]) == 0.0:
+                continue
+            if _all_zero_row(row):
+                continue
+
+            # optional: send t_sec too (frontend can compute it anyway)
+            t_sec = row["idx"] * float(dt_sec)
+            row["t_sec"] = t_sec
+            row["hours"] = t_sec / 3600.0  # frontend accepts "hours" too
+
+            rows.append(row)
+
+        return _apply_smoothing(rows, window=3)
 
     finally:
         try:
