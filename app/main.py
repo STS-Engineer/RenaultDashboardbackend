@@ -13,7 +13,7 @@ import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db import get_conn,get_conn_bt
+from app.db import get_conn, get_conn_bt
 
 app = FastAPI()
 
@@ -613,7 +613,6 @@ async def upload_file(file: UploadFile = File(...)):
                 AND COALESCE(btrim(tension2),'')    ~ '^0*([.,]0*)?$'
                 AND COALESCE(btrim(tension3),'')    ~ '^0*([.,]0*)?$'
           )
-
        """
 
         t_ins0 = time.perf_counter()
@@ -676,7 +675,7 @@ def tests():
 
 
 # -------------------------
-# Helpers for filtering + 150ms smoothing
+# Helpers for filtering + 150ms smoothing  (✅ SINGLE, FIXED COPY)
 # -------------------------
 def _is_zeroish(x: Optional[float], eps: float = 1e-12) -> bool:
     if x is None:
@@ -687,9 +686,14 @@ def _is_zeroish(x: Optional[float], eps: float = 1e-12) -> bool:
         return False
 
 
-def _all_zero_row(row: Dict[str, Optional[float]]) -> bool:
+# ✅ FIXED: only check keys that exist in the row dict.
+# This makes it compatible with BOTH:
+# - /series rows (have vdrop)
+# - /bt/series rows (do NOT have vdrop)
+def _all_zero_row(row: Dict[str, Any]) -> bool:
     keys = ["rpm", "current_a", "vdrop", "b1", "b2", "b3", "b4", "l1", "l2", "sup"]
-    return all(_is_zeroish(row.get(k)) for k in keys)
+    present = [k for k in keys if k in row]
+    return all(_is_zeroish(row.get(k)) for k in present)
 
 
 def _rolling_median(values: List[Optional[float]], window: int = 3) -> List[Optional[float]]:
@@ -708,8 +712,7 @@ def _rolling_median(values: List[Optional[float]], window: int = 3) -> List[Opti
 
 def _apply_smoothing(rows: List[Dict[str, Any]], window: int = 3) -> List[Dict[str, Any]]:
     if not rows:
-        return rows
-
+        return []  # ✅ keep your guard
     fields_to_smooth = ["vdrop", "current_a", "b1", "b2", "b3", "b4", "l1", "l2", "sup"]
     for f in fields_to_smooth:
         series = [r.get(f) for r in rows]
@@ -731,7 +734,6 @@ def series(
     t_start_sec: float = Query(0.0, ge=0.0),
     t_end_sec: float = Query(0.0, ge=0.0),
 ):
-    # ✅ FIX: current ALWAYS from CONS_ALIM_1
     cons_col = "cons_alim_1"
     sfx = f"s{system}"
     vdrop_col = f"tension{system}"
@@ -799,11 +801,9 @@ def series(
                 "sup": r[13],
             }
 
-            # remove RPM=0 lines
             if row["rpm"] is not None and float(row["rpm"]) == 0.0:
                 continue
 
-            # remove all-zero garbage lines
             if _all_zero_row(row):
                 continue
 
@@ -812,9 +812,7 @@ def series(
             row["t_hour"] = t_sec / 3600.0
             rows.append(row)
 
-        # 150ms smoothing => 3 samples for 50ms data
-        rows = _apply_smoothing(rows, window=3)
-        return rows
+        return _apply_smoothing(rows, window=3)
 
     finally:
         try:
@@ -901,292 +899,8 @@ def stats(test_id: int, system: int = 1):
     }
 
 
-# -------------------------
-# ✅ Characterization helper (no DB change)
-# -------------------------
-@app.get("/characterization_point/{test_id}")
-def characterization_point(
-    test_id: int,
-    system: int = 1,
-    rpm_target: int = Query(..., description="Target speed (rpm)"),
-    i_target: float = Query(..., description="Target current (A)"),
-    rpm_tol: int = 50,
-    i_tol: float = 0.2,
-    min_points: int = 2000,
-    start_idx: int = 0,
-    end_idx: Optional[int] = None
-):
-    # ✅ FIX: current always from CONS_ALIM_1
-    cons_col, tension_col = _system_cols(system)
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    if end_idx is None:
-        cur.execute("SELECT MAX(idx) FROM measurements WHERE test_id=%s", (test_id,))
-        end_idx = int(cur.fetchone()[0] or 0)
-
-    cur.execute(f"""
-      SELECT {tension_col}
-      FROM measurements
-      WHERE test_id=%s
-        AND idx BETWEEN %s AND %s
-        AND rpm BETWEEN %s AND %s
-        AND {cons_col} BETWEEN %s AND %s
-        AND {tension_col} IS NOT NULL
-    """, (
-        test_id,
-        start_idx, end_idx,
-        rpm_target - rpm_tol, rpm_target + rpm_tol,
-        i_target - i_tol, i_target + i_tol
-    ))
-
-    vals = [float(r[0]) for r in cur.fetchall() if r[0] is not None]
-    cur.close()
-    conn.close()
-
-    if len(vals) < min_points:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Not enough points after filtering: got {len(vals)}, need >= {min_points}. "
-                   f"Try wider tolerances or correct time window."
-        )
-
-    vals.sort()
-    n = len(vals)
-
-    def pct(p: float) -> float:
-        k = int(round((n - 1) * p))
-        return vals[max(0, min(n - 1, k))]
-
-    return {
-        "system": system,
-        "rpm_target": rpm_target,
-        "i_target": i_target,
-        "rpm_tol": rpm_tol,
-        "i_tol": i_tol,
-        "count": n,
-        "v_median": pct(0.50),
-        "v_p05": pct(0.05),
-        "v_p95": pct(0.95),
-    }
-
-
-# -------------------------
-# Characterization endpoint (no DB change)
-# -------------------------
-SAMPLE_PERIOD_DEFAULT = 0.05  # 50 ms
-
-def _pct(values, p: float):
-    if not values:
-        return None
-    xs = sorted(values)
-    k = int(round((len(xs) - 1) * p))
-    k = max(0, min(len(xs) - 1, k))
-    return xs[k]
-
-
-def _build_empty_grid():
-    speeds = [1000, 4000, 6000, 9000, 12000, 14000]
-    currents = [2, 5, 9, 12, 17, 22]
-    grid = {}
-    for iA in currents:
-        grid[str(iA)] = {}
-        for rpm in speeds:
-            grid[str(iA)][str(rpm)] = {"value": None, "p05": None, "p95": None, "n": 0}
-    return grid
-
-
-@app.get("/characterization/{test_id}")
-def characterization(
-    test_id: int,
-    system: int = 1,
-    life: str = "bol",
-    dt_sec: float = 0.05,
-    min_plateau_sec: int = 60,
-    take_last_sec: int = 60,
-    rpm_tol: float = 150,
-    i_tol: float = 0.4,
-    temp_targets: str = "20,60,90,120",
-    temp_tol: float = 10,
-):
-    if system not in (1, 2, 3):
-        raise HTTPException(status_code=400, detail="system must be 1, 2, or 3")
-
-    life = (life or "").lower().strip()
-    if life == "mol":
-        life = "mid"
-    if life not in ("bol", "mid", "eol"):
-        raise HTTPException(status_code=400, detail="life must be bol, mid, eol (mol is accepted as alias for mid)")
-
-    # ✅ FIX: current always from CONS_ALIM_1, voltage by system
-    cons_col = "cons_alim_1"
-    tension_col = f"tension{system}"
-    rpm_col = "rpm"
-    temp_col = "data_temperature_ss_contact"
-
-    try:
-        targets = [int(x.strip()) for x in temp_targets.split(",") if x.strip()]
-    except Exception:
-        raise HTTPException(status_code=400, detail="temp_targets must be like '20,60,90,120'")
-    if not targets:
-        targets = [20, 60, 90, 120]
-
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT MAX(idx) FROM measurements WHERE test_id=%s", (test_id,))
-        max_idx = cur.fetchone()[0]
-        if max_idx is None or max_idx < 10:
-            raise HTTPException(status_code=400, detail="No data for this test.")
-
-        third = max_idx // 3
-        if life == "bol":
-            start_idx, end_idx = 0, third
-        elif life == "mid":
-            start_idx, end_idx = third, 2 * third
-        else:
-            start_idx, end_idx = 2 * third, max_idx
-
-        cur.execute(f"""
-            SELECT idx, {rpm_col}, {cons_col}, {tension_col}, {temp_col}
-            FROM measurements
-            WHERE test_id=%s AND idx BETWEEN %s AND %s
-            ORDER BY idx
-        """, (test_id, start_idx, end_idx))
-
-        rows = cur.fetchall()
-        if not rows:
-            raise HTTPException(status_code=400, detail="No rows in selected life window.")
-
-        min_plateau_n = max(1, int(min_plateau_sec / dt_sec))
-        take_last_n = max(1, int(take_last_sec / dt_sec))
-
-        temps_out = {str(t): _build_empty_grid() for t in targets}
-
-        rpm_targets = [1000, 4000, 6000, 9000, 12000, 14000]
-        i_targets = [2, 5, 9, 12, 17, 22]
-
-        def nearest_target(v, targets_list, tol):
-            if v is None:
-                return None
-            best = None
-            bestd = 1e18
-            for t in targets_list:
-                d = abs(v - t)
-                if d < bestd:
-                    bestd = d
-                    best = t
-            if best is None:
-                return None
-            if bestd <= tol:
-                return best
-            return None
-
-        def nearest_temp(v):
-            return nearest_target(v, targets, temp_tol)
-
-        cur_plateau = []
-        anchor_rpm = None
-        anchor_i = None
-
-        def flush_plateau():
-            nonlocal cur_plateau
-            if len(cur_plateau) < min_plateau_n:
-                cur_plateau = []
-                return
-
-            tail = cur_plateau[-take_last_n:] if len(cur_plateau) >= take_last_n else cur_plateau
-
-            rpms = [x[0] for x in tail if x[0] is not None]
-            currents = [x[1] for x in tail if x[1] is not None]
-            vdrops = [x[2] for x in tail if x[2] is not None]
-            temps = [x[3] for x in tail if x[3] is not None]
-
-            if not rpms or not currents or not vdrops:
-                cur_plateau = []
-                return
-
-            rpm_med = median(rpms)
-            i_med = median(currents)
-            v_med = median(vdrops)
-            temp_med = median(temps) if temps else None
-
-            rpm_t = nearest_target(rpm_med, rpm_targets, rpm_tol)
-            i_t = nearest_target(i_med, i_targets, i_tol)
-            temp_t = nearest_temp(temp_med)
-
-            if rpm_t is None or i_t is None or temp_t is None:
-                cur_plateau = []
-                return
-
-            cell = temps_out[str(temp_t)][str(i_t)][str(rpm_t)]
-            acc = cell.get("_acc")
-            if acc is None:
-                acc = []
-                cell["_acc"] = acc
-            acc.append(v_med)
-
-            cur_plateau = []
-
-        for (_idx, rpm, cur_a, vdrop, tempv) in rows:
-            if rpm is None or cur_a is None or vdrop is None:
-                flush_plateau()
-                anchor_rpm = None
-                anchor_i = None
-                continue
-
-            if anchor_rpm is None:
-                anchor_rpm = rpm
-                anchor_i = cur_a
-
-            if abs(rpm - anchor_rpm) <= rpm_tol and abs(cur_a - anchor_i) <= i_tol:
-                cur_plateau.append((rpm, cur_a, vdrop, tempv))
-            else:
-                flush_plateau()
-                anchor_rpm = rpm
-                anchor_i = cur_a
-                cur_plateau.append((rpm, cur_a, vdrop, tempv))
-
-        flush_plateau()
-
-        for t in targets:
-            grid = temps_out[str(t)]
-            for iA in list(grid.keys()):
-                for rpmk in list(grid[iA].keys()):
-                    cell = grid[iA][rpmk]
-                    acc = cell.pop("_acc", None)
-                    if not acc:
-                        continue
-                    cell["n"] = len(acc)
-                    cell["value"] = float(median(acc))
-                    cell["p05"] = float(_pct(acc, 0.05))
-                    cell["p95"] = float(_pct(acc, 0.95))
-
-        return {
-            "temps": temps_out,
-            "meta": {
-                "life": life,
-                "system": system,
-                "dt_sec": dt_sec,
-                "temp_col": temp_col,
-                "temp_tol": temp_tol,
-                "window": {"start_idx": int(start_idx), "end_idx": int(end_idx)},
-            },
-        }
-
-    finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
-
 @app.get("/live_series/{test_id}")
-def live_series(
+def live_series_by_test_id(
     test_id: int,
     system: int = Query(1, ge=1, le=3),
     since_idx: int = Query(0, ge=0),
@@ -1255,14 +969,14 @@ def live_series(
 
 
 @app.get("/live_series")
-def live_series(
+def live_series_simple(
     test_id: int,
     system: int = 1,
     from_idx: int = 0,
     limit: int = 500,
     dt_sec: float = 0.05,
 ):
-    cons_col = "cons_alim_1"          # always use CONS_ALIM_1
+    cons_col = "cons_alim_1"
     vdrop_col = f"tension{system}"
     sfx = f"s{system}"
 
@@ -1315,10 +1029,13 @@ def live_series(
         })
 
     return out
+
+
 @app.get("/bt/tests")
 def bt_tests():
     return [{"id": 1, "name": "BT1"}, {"id": 2, "name": "BT2"}]
-    
+
+
 def _sql_safe_float(expr: str) -> str:
     return f"""
     CASE
@@ -1331,6 +1048,7 @@ def _sql_safe_float(expr: str) -> str:
     END
     """.strip()
 
+
 def _sql_safe_bigint(expr: str) -> str:
     return f"""
     CASE
@@ -1341,6 +1059,10 @@ def _sql_safe_bigint(expr: str) -> str:
     END
     """.strip()
 
+
+# -------------------------
+# ✅ FIXED /bt/series endpoint
+# -------------------------
 @app.get("/bt/series/{test_id}")
 def bt_series(
     test_id: int,
@@ -1349,12 +1071,9 @@ def bt_series(
     dt_sec: float = Query(0.05, gt=0.0),
     t_start_sec: float = Query(0.0, ge=0.0),
     t_end_sec: float = Query(0.0, ge=0.0),
-
-    # optional pagination (safe for big tables)
     after_idx: int = Query(-1, description="Return rows with idx > after_idx"),
     limit: int = Query(8000, ge=100, le=50000),
 ):
-    # map test_id -> BT table
     if test_id == 1:
         table = '"Banc_Test_Rotor"."BT1"'
     elif test_id == 2:
@@ -1364,7 +1083,6 @@ def bt_series(
 
     sfx = f"S{system}"
 
-    # time window -> idx window
     start_idx = int(round(t_start_sec / dt_sec)) if t_start_sec > 0 else 0
     end_idx = None
     if t_end_sec and t_end_sec > 0:
@@ -1415,7 +1133,12 @@ def bt_series(
     cur = conn.cursor()
     try:
         cur.execute("SET statement_timeout TO '30s';")
-        cur.execute(sql, params)
+        try:
+            cur.execute(sql, params)
+        except Exception as e:
+            # ✅ shows DB error in Swagger instead of generic "Internal Server Error"
+            raise HTTPException(status_code=500, detail=str(e))
+
         fetched = cur.fetchall()
 
         rows = []
@@ -1436,16 +1159,14 @@ def bt_series(
                 "sup": r[12],
             }
 
-            # same cleaning as your /series endpoint
             if row["rpm"] is not None and float(row["rpm"]) == 0.0:
                 continue
             if _all_zero_row(row):
                 continue
 
-            # optional: send t_sec too (frontend can compute it anyway)
             t_sec = row["idx"] * float(dt_sec)
             row["t_sec"] = t_sec
-            row["hours"] = t_sec / 3600.0  # frontend accepts "hours" too
+            row["hours"] = t_sec / 3600.0
 
             rows.append(row)
 
