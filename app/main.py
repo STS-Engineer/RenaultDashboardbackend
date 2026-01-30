@@ -1087,15 +1087,21 @@ def bt_series(
     end_idx = None
     if t_end_sec and t_end_sec > 0:
         if t_end_sec < t_start_sec:
-            raise HTTPException(status_code=400, detail="t_end_sec must be >= t_start_sec (or 0 for all).")
+            raise HTTPException(
+                status_code=400,
+                detail="t_end_sec must be >= t_start_sec (or 0 for all).",
+            )
         end_idx = int(round(t_end_sec / dt_sec))
 
+    # ✅ Key fix: DO NOT use raw `%` with psycopg placeholders.
+    # Use MOD(idx, %(step)s) (cleanest) instead of (idx % %(step)s)
     where_parts = [
         "idx IS NOT NULL",
         "idx >= %(start)s",
-        "(idx % %(step)s) = 0",
+        "MOD(idx, %(step)s) = 0",
         "idx > %(after)s",
     ]
+
     params = {
         "start": start_idx,
         "step": step,
@@ -1136,7 +1142,7 @@ def bt_series(
         try:
             cur.execute(sql, params)
         except Exception as e:
-            # ✅ shows DB error in Swagger instead of generic "Internal Server Error"
+            # shows DB error in Swagger/curl instead of generic "Internal Server Error"
             raise HTTPException(status_code=500, detail=str(e))
 
         fetched = cur.fetchall()
@@ -1181,3 +1187,4 @@ def bt_series(
             conn.close()
         except Exception:
             pass
+
